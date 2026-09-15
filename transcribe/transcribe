@@ -2,232 +2,301 @@
 set -eu
 
 usage() {
-    printf '%s\n' 'Usage: transcribe [--parallel|--sequential] <input-file>... <output-directory>'
+  cat <<'EOF'
+Usage: transcribe [--parallel|--sequential] <input-file>... [output-directory]
+
+Transcribes audio or video with mlx-community/whisper-large-v3-turbo and writes
+TXT, SRT, and JSON files to an input-named subfolder.
+
+If the final argument is an existing directory, it is the output directory.
+Otherwise every argument is treated as an input. Output directory defaults to current directory (.).
+
+With one input, transcription runs sequentially without asking. With multiple
+inputs, choose 1) parallel or 2) sequential within 10 seconds; no choice uses
+parallel. --parallel checks free RAM before starting each worker and limits
+workers on smaller Macs. Temporary files and MLX worker processes are cleaned
+up when the command exits or is interrupted.
+
+Matching TXT, SRT, and JSON files are replaced; unrelated files are kept.
+EOF
 }
 
 if [ "$#" -eq 0 ]; then
-    usage >&2
-    exit 2
+  usage >&2
+  exit 2
 fi
 
 mode=
-case $1 in
-    --parallel|--sequential)
-        mode=${1#--}
-        shift
-        ;;
-    --help|-h)
-        usage
-        exit 0
-        ;;
+case "$1" in
+  --parallel|--sequential)
+    mode=${1#--}
+    shift
+    ;;
+  --help|-h)
+    usage
+    exit 0
+    ;;
 esac
 
-if [ "$#" -lt 2 ]; then
-    usage >&2
-    exit 2
+if [ "$#" -lt 1 ]; then
+  usage >&2
+  exit 2
 fi
 
-if [ -z "$mode" ]; then
-    printf '%s\n' 'Choose transcription mode:' '1) Parallel (up to 2 files at once)' '2) Sequential (one file at a time)' 'Enter 1 or 2: '
-    IFS= read -r choice || exit 2
-    case $choice in
+last_argument=
+for argument in "$@"; do
+  last_argument=$argument
+done
+
+output_directory=.
+input_count=$#
+if [ "$#" -ge 2 ] && [ -d "$last_argument" ]; then
+  output_directory=$last_argument
+  input_count=$(($# - 1))
+fi
+
+if [ -z "$mode" ] && [ "$input_count" -gt 1 ]; then
+  printf '%s\n' 'Choose transcription mode:' '1) Parallel' '2) Sequential' >&2
+  seconds=10
+  choice=
+  while [ "$seconds" -gt 0 ] && [ -z "$mode" ]; do
+    printf '\rEnter 1 or 2 (%s seconds remaining): ' "$seconds" >&2
+    if IFS= read -r -t 1 choice; then
+      case "$choice" in
         1) mode=parallel ;;
         2) mode=sequential ;;
-        *) printf '%s\n' 'Please enter 1 or 2.' >&2; exit 2 ;;
-    esac
+        *) printf '\nPlease enter 1 or 2.\n' >&2; choice= ;;
+      esac
+    fi
+    seconds=$((seconds - 1))
+  done
+  if [ -z "$mode" ]; then
+    mode=parallel
+    printf '\nNo choice received; using parallel.\n' >&2
+  else
+    printf '\n' >&2
+  fi
+elif [ -z "$mode" ]; then
+  mode=sequential
 fi
 
-output_directory=
-for argument in "$@"; do
-    output_directory=$argument
-done
 mkdir -p "$output_directory"
+
+argument_index=1
+input_error=0
+for input_file in "$@"; do
+  if [ "$argument_index" -le "$input_count" ] && [ ! -d "$input_file" ] && [ ! -f "$input_file" ]; then
+    printf 'Input file not found: %s\n' "$input_file" >&2
+    input_error=1
+  fi
+  argument_index=$((argument_index + 1))
+done
+[ "$input_error" -eq 0 ] || exit 1
 
 worker_pids=
 worker_count=0
-max_workers=1
-memory_budget_percent=25
-
-if [ "$mode" = parallel ]; then
-    memory_bytes=$(sysctl -n hw.memsize 2>/dev/null || printf '0')
-    case $memory_bytes in
-        ''|*[!0-9]*) ;;
-        *) [ "$memory_bytes" -ge 25769803776 ] && max_workers=2 ;;
-    esac
-    printf 'Parallel mode: up to %s MLX worker(s); %s%% free RAM required per worker.\n' "$max_workers" "$memory_budget_percent"
-fi
-
-read_free_percent() {
-    memory_pressure -Q 2>/dev/null |
-        awk '/free percentage/ {gsub("%", "", $NF); print $NF; exit}'
-}
-
-wait_for_memory() {
-    required_free_percent=$1
-    while :; do
-        free_percent=$(read_free_percent)
-        case $free_percent in
-            ''|*[!0-9]*)
-                printf '%s\n' 'Unable to read current free RAM from memory_pressure.' >&2
-                return 1
-                ;;
-        esac
-        if [ "$free_percent" -ge "$required_free_percent" ]; then
-            return 0
-        fi
-        printf 'Waiting for memory: %s%% free; need %s%%.\n' "$free_percent" "$required_free_percent" >&2
-        sleep 5
-    done
-}
 
 cleanup_workers() {
-    for worker_pid in $worker_pids; do
-        kill "$worker_pid" 2>/dev/null || true
-    done
+  for worker_pid in $worker_pids; do
+    kill -TERM "$worker_pid" 2>/dev/null || true
+  done
+  for worker_pid in $worker_pids; do
+    wait "$worker_pid" 2>/dev/null || true
+  done
+  worker_pids=
+  worker_count=0
 }
+
 trap cleanup_workers EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM HUP
 trap 'exit 131' QUIT
 
-script_path=$(realpath "$0")
-script_directory=$(CDPATH= cd -- "$(dirname -- "$script_path")" && pwd)
-mlx_whisper=$script_directory/../libexec/venv/bin/mlx_whisper
-if [ ! -x "$mlx_whisper" ] && [ -x /usr/local/lib/video-transcriber/venv/bin/mlx_whisper ]; then
-    mlx_whisper=/usr/local/lib/video-transcriber/venv/bin/mlx_whisper
+max_workers=1
+memory_budget_percent=25
+if [ "$mode" = parallel ]; then
+  memory_bytes=$(sysctl -n hw.memsize 2>/dev/null || printf '0')
+  case "$memory_bytes" in
+    ''|*[!0-9]*) ;;
+    *)
+      if [ "$memory_bytes" -ge 25769803776 ]; then
+        max_workers=2
+      fi
+      ;;
+  esac
+  printf 'Parallel mode: up to %s MLX worker(s); %s%% free RAM required per worker.\n' \
+    "$max_workers" "$memory_budget_percent" >&2
 fi
+
+read_free_percent() {
+  memory_pressure -Q 2>/dev/null |
+    awk '/free percentage/ {gsub("%", "", $NF); print $NF; exit}'
+}
+
+wait_for_memory() {
+  required_free_percent=$1
+  while :; do
+    free_percent=$(read_free_percent)
+    case "$free_percent" in
+      ''|*[!0-9]*)
+        printf '%s\n' 'Unable to read current free RAM from memory_pressure.' >&2
+        return 1
+        ;;
+    esac
+    if [ "$free_percent" -ge "$required_free_percent" ]; then
+      return 0
+    fi
+    printf 'Waiting for free RAM: %s%% available; need %s%%.\n' \
+      "$free_percent" "$required_free_percent" >&2
+    sleep 5
+  done
+}
+
+script_directory=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+mlx_whisper=$script_directory/../libexec/venv/bin/mlx_whisper
+runtime_directory=${TRANSCRIBE_RUNTIME_DIR:-}
+if [ -n "$runtime_directory" ] && [ -x "$runtime_directory/venv/bin/mlx_whisper" ]; then
+  mlx_whisper=$runtime_directory/venv/bin/mlx_whisper
+fi
+if [ ! -x "$mlx_whisper" ] && [ -x /usr/local/lib/video-transcriber/venv/bin/mlx_whisper ]; then
+  mlx_whisper=/usr/local/lib/video-transcriber/venv/bin/mlx_whisper
+fi
+
 if [ ! -x "$mlx_whisper" ]; then
-    runtime_directory=${TRANSCRIBE_RUNTIME_DIR:-}
-    if [ -z "$runtime_directory" ] && command -v brew >/dev/null 2>&1; then
-        runtime_directory=$(brew --prefix)/var/transcribe
+  if [ -z "$runtime_directory" ] && command -v brew >/dev/null 2>&1; then
+    runtime_directory=$(brew --prefix)/var/transcribe
+  fi
+  if [ -z "$runtime_directory" ]; then
+    runtime_directory=${XDG_CACHE_HOME:-$HOME/.cache}/transcribe
+  fi
+  venv_directory=$runtime_directory/venv
+
+  python3_path=$(command -v python3 || true)
+  if command -v brew >/dev/null 2>&1; then
+    brew_python_prefix=$(brew --prefix python@3.14 2>/dev/null || true)
+    if [ -x "$brew_python_prefix/bin/python3.14" ]; then
+      python3_path=$brew_python_prefix/bin/python3.14
     fi
-    if [ -z "$runtime_directory" ]; then
-        runtime_directory=${XDG_CACHE_HOME:-$HOME/.cache}/transcribe
-    fi
-    venv_directory=$runtime_directory/venv
-    python3_path=$(command -v python3 || true)
-    if command -v brew >/dev/null 2>&1; then
-        brew_python_prefix=$(brew --prefix python@3.14 2>/dev/null || true)
-        if [ -x "$brew_python_prefix/bin/python3.14" ]; then
-            python3_path=$brew_python_prefix/bin/python3.14
-        fi
-    fi
-    if [ -z "$python3_path" ]; then
-        printf '%s\n' 'transcribe: Python 3 is required.' >&2
-        exit 1
-    fi
-    if [ ! -x "$venv_directory/bin/python" ]; then
-        printf '%s\n' 'Installing mlx-whisper (first run only)...'
-        mkdir -p "$runtime_directory"
-        "$python3_path" -m venv "$venv_directory"
-    fi
-    if [ ! -x "$venv_directory/bin/mlx_whisper" ]; then
-        "$venv_directory/bin/python" -m pip install --disable-pip-version-check mlx-whisper
-    fi
-    mlx_whisper=$venv_directory/bin/mlx_whisper
+  fi
+  if [ -z "$python3_path" ]; then
+    printf '%s\n' 'transcribe: Python 3 required.' >&2
+    exit 1
+  fi
+
+  if [ ! -x "$venv_directory/bin/python" ]; then
+    printf '%s\n' 'Installing mlx-whisper (first run only)...' >&2
+    mkdir -p "$runtime_directory"
+    "$python3_path" -m venv "$venv_directory"
+  fi
+  if [ ! -x "$venv_directory/bin/mlx_whisper" ]; then
+    "$venv_directory/bin/python" -m pip install --disable-pip-version-check mlx-whisper
+  fi
+  mlx_whisper=$venv_directory/bin/mlx_whisper
 fi
 
 transcribe_one() (
-    input_file=$1
-    output_directory=$2
+  input_file=$1
+  output_directory=$2
+  if [ -d "$input_file" ]; then
+    printf 'Skipping directory: %s\n' "$input_file"
+    exit 0
+  fi
+  if [ ! -f "$input_file" ]; then
+    printf 'Input file not found: %s\n' "$input_file" >&2
+    exit 1
+  fi
 
-    if [ -d "$input_file" ]; then
-        printf 'Skipping directory: %s\n' "$input_file"
-        exit 0
+  media_file=${input_file##*/}
+  media_name=${media_file%.*}
+  [ -n "$media_name" ] || media_name=$media_file
+  output_folder=$output_directory/$media_name
+  mkdir -p "$output_folder"
+
+  temporary_folder=
+  whisper_pid=
+  cleanup_one() {
+    if [ -n "$whisper_pid" ]; then
+      kill -TERM "$whisper_pid" 2>/dev/null || true
+      wait "$whisper_pid" 2>/dev/null || true
     fi
-    if [ ! -f "$input_file" ]; then
-        printf 'Input file not found: %s\n' "$input_file" >&2
-        exit 1
+    if [ -n "$temporary_folder" ]; then
+      rm -rf "$temporary_folder"
     fi
+  }
+  trap cleanup_one EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM HUP
+  trap 'exit 131' QUIT
 
-    media_file=${input_file##*/}
-    media_name=${media_file%.*}
-    [ -n "$media_name" ] || media_name=$media_file
-    output_folder=$output_directory/$media_name
-    mkdir -p "$output_folder"
-
-    temporary_folder=
+  temporary_folder=$(mktemp -d "${TMPDIR:-/tmp}/transcribe.XXXXXX")
+  printf 'Transcribing: %s\n' "$input_file"
+  "$mlx_whisper" \
+    --model mlx-community/whisper-large-v3-turbo \
+    --task transcribe \
+    --language en \
+    --condition-on-previous-text False \
+    --output-dir "$temporary_folder" \
+    --output-name "$media_name" \
+    --output-format all \
+    "$input_file" &
+  whisper_pid=$!
+  if ! wait "$whisper_pid"; then
     whisper_pid=
-    cleanup_one() {
-        if [ -n "$whisper_pid" ]; then
-            kill "$whisper_pid" 2>/dev/null || true
-            wait "$whisper_pid" 2>/dev/null || true
-        fi
-        if [ -n "$temporary_folder" ]; then
-            rm -rf "$temporary_folder"
-        fi
-    }
-    trap cleanup_one EXIT
-    trap 'exit 130' INT
-    trap 'exit 143' TERM HUP
-    trap 'exit 131' QUIT
+    exit 1
+  fi
+  whisper_pid=
 
-    temporary_folder=$(mktemp -d "${TMPDIR:-/tmp}/transcribe.XXXXXX")
-    printf 'Transcribing: %s\n' "$input_file"
-    "$mlx_whisper" \
-        --model mlx-community/whisper-large-v3-turbo \
-        --task transcribe \
-        --language en \
-        --condition-on-previous-text False \
-        --output-dir "$temporary_folder" \
-        --output-name "$media_name" \
-        --output-format all \
-        "$input_file" &
-    whisper_pid=$!
-    if wait "$whisper_pid"; then
-        whisper_pid=
-    else
-        exit_code=$?
-        whisper_pid=
-        exit "$exit_code"
+  for extension in txt srt json; do
+    if [ ! -f "$temporary_folder/$media_name.$extension" ]; then
+      printf 'Expected output missing: %s\n' "$media_name.$extension" >&2
+      exit 1
     fi
-
-    for extension in txt srt json; do
-        if [ ! -f "$temporary_folder/$media_name.$extension" ]; then
-            printf 'Expected output missing: %s\n' "$media_name.$extension" >&2
-            exit 1
-        fi
-        mv -f "$temporary_folder/$media_name.$extension" "$output_folder/$media_name.$extension"
-    done
-    printf 'Output folder: %s\n' "$output_folder"
+    mv -f "$temporary_folder/$media_name.$extension" "$output_folder/$media_name.$extension"
+  done
+  printf 'Output folder: %s\n' "$output_folder"
 )
 
-wait_for_workers() {
-    worker_failed=0
-    for worker_pid in $worker_pids; do
-        if ! wait "$worker_pid"; then
-            worker_failed=1
-        fi
-    done
-    worker_pids=
-    worker_count=0
-    [ "$worker_failed" -eq 0 ]
-}
-
+worker_failed=0
 argument_index=1
 for input_file in "$@"; do
-    if [ "$argument_index" -lt "$#" ]; then
-        if [ "$mode" = parallel ]; then
-            required_free_percent=$((memory_budget_percent * (worker_count + 1)))
-            if ! wait_for_memory "$required_free_percent"; then
-                exit 1
+  if [ "$argument_index" -le "$input_count" ]; then
+    if [ "$mode" = parallel ]; then
+      required_free_percent=$((memory_budget_percent * (worker_count + 1)))
+      if wait_for_memory "$required_free_percent"; then
+        transcribe_one "$input_file" "$output_directory" &
+        worker_pids="$worker_pids $!"
+        worker_count=$((worker_count + 1))
+        if [ "$worker_count" -ge "$max_workers" ]; then
+          failed_batch=0
+          for worker_pid in $worker_pids; do
+            if ! wait "$worker_pid"; then
+              failed_batch=1
             fi
-            transcribe_one "$input_file" "$output_directory" &
-            worker_pids="$worker_pids $!"
-            worker_count=$((worker_count + 1))
-            if [ "$worker_count" -ge "$max_workers" ]; then
-                wait_for_workers || exit 1
-            fi
-        else
-            if ! wait_for_memory "$memory_budget_percent"; then
-                exit 1
-            fi
-            transcribe_one "$input_file" "$output_directory"
+          done
+          worker_pids=
+          worker_count=0
+          [ "$failed_batch" -eq 0 ] || worker_failed=1
         fi
+      else
+        worker_failed=1
+      fi
+    else
+      if wait_for_memory "$memory_budget_percent" && ! transcribe_one "$input_file" "$output_directory"; then
+        worker_failed=1
+      fi
     fi
-    argument_index=$((argument_index + 1))
+  fi
+  argument_index=$((argument_index + 1))
 done
 
 if [ "$mode" = parallel ] && [ "$worker_count" -gt 0 ]; then
-    wait_for_workers || exit 1
+  failed_batch=0
+  for worker_pid in $worker_pids; do
+    if ! wait "$worker_pid"; then
+      failed_batch=1
+    fi
+  done
+  [ "$failed_batch" -eq 0 ] || worker_failed=1
 fi
+
+exit "$worker_failed"
